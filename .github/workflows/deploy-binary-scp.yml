@@ -1,0 +1,114 @@
+name: Build backend+frontend and deploy (scp -> systemd)
+
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    env:
+      TARGET_DIR: ${{ secrets.TARGET_DIR }}
+      TARGET_PLATFORM: ${{ secrets.TARGET_PLATFORM || 'linux/amd64' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepare Docker Buildx (for cross-platform build)
+        run: |
+          docker run --privileged --rm tonistiigi/binfmt:latest --install all || true
+          docker buildx create --use --name buildx || true
+          docker buildx inspect --bootstrap
+        shell: bash
+
+      - name: Build backend with buildx for ${{ env.TARGET_PLATFORM }} and export filesystem
+        run: |
+          # 使用 buildx 将 backend-builder 阶段导出到本地目录 out/ （包含 /app）
+          docker buildx build --platform "${TARGET_PLATFORM}" --target backend-builder --output type=local,dest=./out .
+          if [ -f ./out/app/nofx ]; then
+            cp ./out/app/nofx ./nofx
+            chmod +x ./nofx
+          else
+            echo "ERROR: built binary not found in out/app/nofx"
+            ls -la out || true
+            exit 1
+          fi
+        shell: bash
+
+      - name: Install binutils and inspect binary
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y binutils
+          echo "Binary file info:" && file ./nofx || true
+          echo "ELF header:" && readelf -h ./nofx || true
+          echo "Shared library dependencies (readelf NEEDED):" && readelf -d ./nofx | grep NEEDED -A3 || true
+
+      - name: Check binary arch matches TARGET_PLATFORM
+        run: |
+          file_out=$(file ./nofx)
+          echo "$file_out"
+          if [ "${TARGET_PLATFORM}" = "linux/amd64" ]; then
+            echo "$file_out" | grep -q 'x86-64' || { echo "Binary arch mismatch: expected x86-64"; exit 1; }
+          elif [ "${TARGET_PLATFORM}" = "linux/arm64" ] || [ "${TARGET_PLATFORM}" = "linux/aarch64" ]; then
+            echo "$file_out" | grep -q 'aarch64' || { echo "Binary arch mismatch: expected aarch64"; exit 1; }
+          else
+            echo "Unknown target platform '${TARGET_PLATFORM}', skipping strict arch check. file output: $file_out"
+          fi
+        shell: bash
+
+      - name: Build frontend
+        working-directory: ./web
+        run: |
+          npm ci
+          npm run build
+        shell: bash
+
+      - name: Archive artifacts for transfer
+        run: |
+          tar -czf nofx_dist.tar.gz nofx web/dist
+        shell: bash
+
+      - name: Copy artifacts to server (SCP)
+        uses: appleboy/scp-action@v0.1.8
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          port: ${{ secrets.SERVER_PORT || '22' }}
+          source: "nofx_dist.tar.gz"
+          target: ${{ secrets.TARGET_DIR }}
+
+      - name: Deploy on server: unpack, move, set perms, restart systemd
+        uses: appleboy/ssh-action@v0.1.7
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          port: ${{ secrets.SERVER_PORT || '22' }}
+          script: |
+            set -e
+            cd "${{ secrets.TARGET_DIR }}"
+            ts=$(date +%Y%m%d%H%M%S)
+            # 备份老文件（可选）
+            if [ -d run_backup ]; then rm -rf run_backup; fi
+            mkdir -p run_backup
+            cp -r nofx web dist run_backup/ 2>/dev/null || true
+
+            # 解包并放置
+            tar -xzf nofx_dist.tar.gz -C .
+            chmod +x ./nofx
+
+            # 把前端放到预期目录（依据你的 nginx/system 配置调整）
+            mkdir -p /home/${{ secrets.SERVER_USER }}/nofx/web/dist
+            cp -r web/dist/* /home/${{ secrets.SERVER_USER }}/nofx/web/dist/ || true
+
+            # 设置配置文件权限（假如 config.json 存在）
+            if [ -f config.json ]; then
+              chmod 600 config.json
+            fi
+
+            # 重启 systemd 服务（假设已在服务器上创建 nofx.service）
+            sudo systemctl daemon-reload || true
+            sudo systemctl restart nofx.service
+            sudo systemctl status nofx.service --no-pager || true
