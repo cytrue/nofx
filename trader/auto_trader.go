@@ -66,14 +66,15 @@ type AutoTraderConfig struct {
 }
 
 // AutoTrader 自动交易器
-type AutoTrader struct {
+	type AutoTrader struct {
 	id                    string // Trader唯一标识
 	name                  string // Trader显示名称
-	aiModel               string // AI模型名称
-	exchange              string // 交易平台名称
+	aiModel               string // 主AI模型名称
+	secondaryAIModel      string // 辅AI模型名称
 	config                AutoTraderConfig
 	trader                Trader // 使用Trader接口（支持多平台）
-	mcpClient             *mcp.Client
+	primaryClient         *mcp.Client      // 主AI客户端
+	secondaryClient       *mcp.Client      // 辅AI客户端
 	decisionLogger        *logger.DecisionLogger // 决策日志记录器
 	initialBalance        float64
 	dailyPnL              float64
@@ -83,6 +84,13 @@ type AutoTrader struct {
 	startTime             time.Time        // 系统启动时间
 	callCount             int              // AI调用次数
 	positionFirstSeenTime map[string]int64 // 持仓首次出现时间 (symbol_side -> timestamp毫秒)
+	activePositions       map[string]activePositionState // 仓位激活状态，包含止盈止损
+}
+
+// activePositionState 存储每个活动仓位的止盈止损状态
+type activePositionState struct {
+	StopLoss   float64
+	TakeProfit float64
 }
 
 // NewAutoTrader 创建自动交易器
@@ -102,22 +110,14 @@ func NewAutoTrader(config AutoTraderConfig) (*AutoTrader, error) {
 		}
 	}
 
-	mcpClient := mcp.New()
+	// 初始化双AI客户端
+	log.Printf("🤖 [%s] 初始化主模型: DeepSeek", config.Name)
+	primaryClient := mcp.New()
+	primaryClient.SetDeepSeekAPIKey(config.DeepSeekKey)
 
-	// 初始化AI
-	if config.AIModel == "custom" {
-		// 使用自定义API
-		mcpClient.SetCustomAPI(config.CustomAPIURL, config.CustomAPIKey, config.CustomModelName)
-		log.Printf("🤖 [%s] 使用自定义AI API: %s (模型: %s)", config.Name, config.CustomAPIURL, config.CustomModelName)
-	} else if config.UseQwen || config.AIModel == "qwen" {
-		// 使用Qwen
-		mcpClient.SetQwenAPIKey(config.QwenKey, "")
-		log.Printf("🤖 [%s] 使用阿里云Qwen AI", config.Name)
-	} else {
-		// 默认使用DeepSeek
-		mcpClient.SetDeepSeekAPIKey(config.DeepSeekKey)
-		log.Printf("🤖 [%s] 使用DeepSeek AI", config.Name)
-	}
+	log.Printf("🤖 [%s] 初始化验证模型: Qwen", config.Name)
+	secondaryClient := mcp.New()
+	secondaryClient.SetQwenAPIKey(config.QwenKey, "")
 
 	// 初始化币种池API
 	if config.CoinPoolAPIURL != "" {
@@ -165,11 +165,12 @@ func NewAutoTrader(config AutoTraderConfig) (*AutoTrader, error) {
 	return &AutoTrader{
 		id:                    config.ID,
 		name:                  config.Name,
-		aiModel:               config.AIModel,
-		exchange:              config.Exchange,
+		aiModel:               "deepseek", // 主模型固定为deepseek
+		secondaryAIModel:      "qwen",     // 辅模型固定为qwen
 		config:                config,
 		trader:                trader,
-		mcpClient:             mcpClient,
+		primaryClient:         primaryClient,
+		secondaryClient:       secondaryClient,
 		decisionLogger:        decisionLogger,
 		initialBalance:        config.InitialBalance,
 		lastResetTime:         time.Now(),
@@ -177,6 +178,7 @@ func NewAutoTrader(config AutoTraderConfig) (*AutoTrader, error) {
 		callCount:             0,
 		isRunning:             false,
 		positionFirstSeenTime: make(map[string]int64),
+		activePositions:       make(map[string]activePositionState),
 	}, nil
 }
 
@@ -282,12 +284,25 @@ func (at *AutoTrader) runCycle() error {
 		record.CandidateCoins = append(record.CandidateCoins, coin.Symbol)
 	}
 
+	// 保存市场数据快照
+	record.MarketData = make(map[string]logger.MarketDataSnapshot)
+	for symbol, data := range ctx.MarketDataMap {
+		if data != nil {
+			record.MarketData[symbol] = logger.MarketDataSnapshot{
+				CurrentPrice: data.CurrentPrice,
+				CurrentVWAP:  data.CurrentVWAP,
+				CurrentRSI7:  data.CurrentRSI7,
+				CurrentMACD:  data.CurrentMACD,
+			}
+		}
+	}
+
 	log.Printf("📊 账户净值: %.2f USDT | 可用: %.2f USDT | 持仓: %d",
 		ctx.Account.TotalEquity, ctx.Account.AvailableBalance, ctx.Account.PositionCount)
 
-	// 4. 调用AI获取完整决策
-	log.Println("🤖 正在请求AI分析并决策...")
-	decision, err := decision.GetFullDecision(ctx, at.mcpClient)
+	// 4. 调用双AI获取完整决策
+	log.Println("🤖 正在请求主模型(DeepSeek)分析并决策...")
+	decision, err := decision.GetFullDecision(ctx, at.primaryClient, at.secondaryClient)
 
 	// 即使有错误，也保存思维链、决策和输入prompt（用于debug）
 	if decision != nil {
@@ -300,20 +315,39 @@ func (at *AutoTrader) runCycle() error {
 	}
 
 	if err != nil {
-		record.Success = false
-		record.ErrorMessage = fmt.Sprintf("获取AI决策失败: %v", err)
-
-		// 打印AI思维链（即使有错误）
-		if decision != nil && decision.CoTTrace != "" {
-			log.Printf("\n" + strings.Repeat("-", 70))
-			log.Println("💭 AI思维链分析（错误情况）:")
-			log.Println(strings.Repeat("-", 70))
-			log.Println(decision.CoTTrace)
-			log.Printf(strings.Repeat("-", 70) + "\n")
+		log.Printf("❌ 获取AI决策失败: %v", err)
+		log.Println("🛡️ 触发安全保护机制，执行本地止盈止损检查...")
+		// AI决策失败，执行本地止盈止损检查
+		if failsafeErr := at.runFailsafeCycle(ctx); failsafeErr != nil {
+			log.Printf("❌ 安全保护机制执行失败: %v", failsafeErr)
+			// 记录原始错误和安全机制的错误
+			record.ErrorMessage = fmt.Sprintf("获取AI决策失败: %v; 安全机制执行失败: %v", err, failsafeErr)
+		} else {
+			record.ErrorMessage = fmt.Sprintf("获取AI决策失败: %v; 已执行本地止盈止损检查", err)
 		}
 
+		record.Success = false
+		// 即使有错误，也保存思维链、决策和输入prompt（用于debug）
+		if decision != nil {
+			record.InputPrompt = decision.UserPrompt
+			record.CoTTrace = decision.CoTTrace
+			if len(decision.Decisions) > 0 {
+				decisionJSON, _ := json.MarshalIndent(decision.Decisions, "", "  ")
+				record.DecisionJSON = string(decisionJSON)
+			}
+		}
 		at.decisionLogger.LogDecision(record)
-		return fmt.Errorf("获取AI决策失败: %w", err)
+		return nil // 返回nil以允许下一个周期继续
+	}
+
+	// 打印交叉验证结果
+	if len(decision.ValidationTrace) > 0 {
+		log.Println("\n🔍 AI交叉验证结果:")
+		for _, trace := range decision.ValidationTrace {
+			log.Println(trace)
+		}
+		// 添加到永久日志记录中
+		record.ValidationTrace = decision.ValidationTrace
 	}
 
 	// 5. 打印AI思维链
@@ -515,11 +549,13 @@ func (at *AutoTrader) buildTradingContext() (*decision.Context, error) {
 	performance, err := at.decisionLogger.AnalyzePerformance(100)
 	if err != nil {
 		log.Printf("⚠️  分析历史表现失败: %v", err)
-		// 不影响主流程，继续执行（但设置performance为nil以避免传递错误数据）
 		performance = nil
 	}
 
-	// 6. 构建上下文
+	// 6. 生成交易洞察
+	insights := logger.GenerateTradingInsights(performance)
+
+	// 7. 构建上下文
 	ctx := &decision.Context{
 		CurrentTime:     time.Now().Format("2006-01-02 15:04:05"),
 		RuntimeMinutes:  int(time.Since(at.startTime).Minutes()),
@@ -538,6 +574,7 @@ func (at *AutoTrader) buildTradingContext() (*decision.Context, error) {
 		Positions:      positionInfos,
 		CandidateCoins: candidateCoins,
 		Performance:    performance, // 添加历史表现分析
+		TradingInsights: insights,      // 添加交易复盘洞察
 	}
 
 	return ctx, nil
@@ -604,6 +641,12 @@ func (at *AutoTrader) executeOpenLongWithRecord(decision *decision.Decision, act
 	posKey := decision.Symbol + "_long"
 	at.positionFirstSeenTime[posKey] = time.Now().UnixMilli()
 
+	// 存储止盈止损状态
+	at.activePositions[posKey] = activePositionState{
+		StopLoss:   decision.StopLoss,
+		TakeProfit: decision.TakeProfit,
+	}
+
 	// 设置止损止盈
 	if err := at.trader.SetStopLoss(decision.Symbol, "LONG", quantity, decision.StopLoss); err != nil {
 		log.Printf("  ⚠ 设置止损失败: %v", err)
@@ -657,6 +700,12 @@ func (at *AutoTrader) executeOpenShortWithRecord(decision *decision.Decision, ac
 	posKey := decision.Symbol + "_short"
 	at.positionFirstSeenTime[posKey] = time.Now().UnixMilli()
 
+	// 存储止盈止损状态
+	at.activePositions[posKey] = activePositionState{
+		StopLoss:   decision.StopLoss,
+		TakeProfit: decision.TakeProfit,
+	}
+
 	// 设置止损止盈
 	if err := at.trader.SetStopLoss(decision.Symbol, "SHORT", quantity, decision.StopLoss); err != nil {
 		log.Printf("  ⚠ 设置止损失败: %v", err)
@@ -691,6 +740,11 @@ func (at *AutoTrader) executeCloseLongWithRecord(decision *decision.Decision, ac
 	}
 
 	log.Printf("  ✓ 平仓成功")
+
+	// 清理止盈止损状态
+	posKey := decision.Symbol + "_long"
+	delete(at.activePositions, posKey)
+
 	return nil
 }
 
@@ -717,6 +771,81 @@ func (at *AutoTrader) executeCloseShortWithRecord(decision *decision.Decision, a
 	}
 
 	log.Printf("  ✓ 平仓成功")
+
+	// 清理止盈止损状态
+	posKey := decision.Symbol + "_short"
+	delete(at.activePositions, posKey)
+
+	return nil
+}
+
+// runFailsafeCycle 在AI决策失败时运行的应急周期
+func (at *AutoTrader) runFailsafeCycle(ctx *decision.Context) error {
+	log.Println("🛡️ Failsafe: Checking positions against local SL/TP.")
+
+	if len(ctx.Positions) == 0 {
+		log.Println("🛡️ Failsafe: No open positions to check.")
+		return nil
+	}
+
+	for _, pos := range ctx.Positions {
+		posKey := pos.Symbol + "_" + pos.Side
+		state, exists := at.activePositions[posKey]
+
+		if !exists {
+			log.Printf("🛡️ Failsafe: No local SL/TP found for position %s. Skipping.", posKey)
+			continue
+		}
+
+		log.Printf("🛡️ Failsafe: Checking %s. Mark Price: %.4f, SL: %.4f, TP: %.4f",
+			pos.Symbol, pos.MarkPrice, state.StopLoss, state.TakeProfit)
+
+		var closeReason string
+		shouldClose := false
+
+		if pos.Side == "long" {
+			if pos.MarkPrice <= state.StopLoss {
+				shouldClose = true
+				closeReason = "本地止损触发 (Failsafe Stop-Loss)"
+			} else if pos.MarkPrice >= state.TakeProfit {
+				shouldClose = true
+				closeReason = "本地止盈触发 (Failsafe Take-Profit)"
+			}
+		} else if pos.Side == "short" {
+			if pos.MarkPrice >= state.StopLoss {
+				shouldClose = true
+				closeReason = "本地止损触发 (Failsafe Stop-Loss)"
+			} else if pos.MarkPrice <= state.TakeProfit {
+				shouldClose = true
+				closeReason = "本地止盈触发 (Failsafe Take-Profit)"
+			}
+		}
+
+		if shouldClose {
+			log.Printf("🛡️ Failsafe: Closing %s position for %s due to: %s", pos.Side, pos.Symbol, closeReason)
+
+			closeDecision := &decision.Decision{
+				Symbol:    pos.Symbol,
+				Action:    "close_" + pos.Side,
+				Reasoning: closeReason,
+			}
+
+			actionRecord := &logger.DecisionAction{
+				Action:    closeDecision.Action,
+				Symbol:    closeDecision.Symbol,
+				Timestamp: time.Now(),
+				Success:   false,
+			}
+
+			if err := at.executeDecisionWithRecord(closeDecision, actionRecord); err != nil {
+				log.Printf("❌ Failsafe: Failed to execute close for %s: %v", pos.Symbol, err)
+				// 继续检查下一个仓位
+			} else {
+				log.Printf("✓ Failsafe: Successfully closed %s position for %s.", pos.Side, pos.Symbol)
+			}
+		}
+	}
+
 	return nil
 }
 
@@ -751,7 +880,7 @@ func (at *AutoTrader) GetStatus() map[string]interface{} {
 		"trader_id":       at.id,
 		"trader_name":     at.name,
 		"ai_model":        at.aiModel,
-		"exchange":        at.exchange,
+		"exchange":        at.config.Exchange,
 		"is_running":      at.isRunning,
 		"start_time":      at.startTime.Format(time.RFC3339),
 		"runtime_minutes": int(time.Since(at.startTime).Minutes()),

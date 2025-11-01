@@ -19,6 +19,7 @@ type Data struct {
 	CurrentEMA20      float64
 	CurrentMACD       float64
 	CurrentRSI7       float64
+	CurrentVWAP       float64
 	OpenInterest      *OIData
 	FundingRate       float64
 	IntradaySeries    *IntradayData
@@ -85,6 +86,7 @@ func Get(symbol string) (*Data, error) {
 	currentEMA20 := calculateEMA(klines3m, 20)
 	currentMACD := calculateMACD(klines3m)
 	currentRSI7 := calculateRSI(klines3m, 7)
+	currentVWAP := calculateVWAP(klines3m)
 
 	// 计算价格变化百分比
 	// 1小时价格变化 = 20个3分钟K线前的价格
@@ -129,6 +131,7 @@ func Get(symbol string) (*Data, error) {
 		CurrentEMA20:      currentEMA20,
 		CurrentMACD:       currentMACD,
 		CurrentRSI7:       currentRSI7,
+		CurrentVWAP:       currentVWAP,
 		OpenInterest:      oiData,
 		FundingRate:       fundingRate,
 		IntradaySeries:    intradayData,
@@ -259,6 +262,28 @@ func calculateRSI(klines []Kline, period int) float64 {
 	rsi := 100 - (100 / (1 + rs))
 
 	return rsi
+}
+
+// calculateVWAP 计算VWAP
+func calculateVWAP(klines []Kline) float64 {
+	if len(klines) == 0 {
+		return 0
+	}
+
+	var totalVolume float64
+	var totalPV float64
+
+	for _, k := range klines {
+		typicalPrice := (k.High + k.Low + k.Close) / 3
+		totalPV += typicalPrice * k.Volume
+		totalVolume += k.Volume
+	}
+
+	if totalVolume == 0 {
+		return 0
+	}
+
+	return totalPV / totalVolume
 }
 
 // calculateATR 计算ATR
@@ -456,8 +481,8 @@ func getFundingRate(symbol string) (float64, error) {
 func Format(data *Data) string {
 	var sb strings.Builder
 
-	sb.WriteString(fmt.Sprintf("current_price = %.2f, current_ema20 = %.3f, current_macd = %.3f, current_rsi (7 period) = %.3f\n\n",
-		data.CurrentPrice, data.CurrentEMA20, data.CurrentMACD, data.CurrentRSI7))
+	sb.WriteString(fmt.Sprintf("current_price = %.2f, current_vwap = %.3f, current_ema20 = %.3f, current_macd = %.3f, current_rsi (7 period) = %.3f\n\n",
+		data.CurrentPrice, data.CurrentVWAP, data.CurrentEMA20, data.CurrentMACD, data.CurrentRSI7))
 
 	sb.WriteString(fmt.Sprintf("In addition, here is the latest %s open interest and funding rate for perps:\n\n",
 		data.Symbol))

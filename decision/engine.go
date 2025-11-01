@@ -66,6 +66,7 @@ type Context struct {
 	Performance     interface{}             `json:"-"` // 历史表现分析（logger.PerformanceAnalysis）
 	BTCETHLeverage  int                     `json:"-"` // BTC/ETH杠杆倍数（从配置读取）
 	AltcoinLeverage int                     `json:"-"` // 山寨币杠杆倍数（从配置读取）
+	TradingInsights string                  `json:"-"` // 交易复盘洞察
 }
 
 // Decision AI的交易决策
@@ -85,36 +86,114 @@ type Decision struct {
 type FullDecision struct {
 	UserPrompt string     `json:"user_prompt"` // 发送给AI的输入prompt
 	CoTTrace   string     `json:"cot_trace"`   // 思维链分析（AI输出）
-	Decisions  []Decision `json:"decisions"`   // 具体决策列表
-	Timestamp  time.Time  `json:"timestamp"`
+	Decisions       []Decision `json:"decisions"`   // 具体决策列表
+	ValidationTrace []string   `json:"validation_trace"` // 交叉验证记录
+	Timestamp       time.Time  `json:"timestamp"`
 }
 
-// GetFullDecision 获取AI的完整交易决策（批量分析所有币种和持仓）
-func GetFullDecision(ctx *Context, mcpClient *mcp.Client) (*FullDecision, error) {
+// GetFullDecision 获取AI的完整交易决策（包含双模型交叉验证）
+func GetFullDecision(ctx *Context, primaryClient *mcp.Client, secondaryClient *mcp.Client) (*FullDecision, error) {
 	// 1. 为所有币种获取市场数据
 	if err := fetchMarketDataForContext(ctx); err != nil {
 		return nil, fmt.Errorf("获取市场数据失败: %w", err)
 	}
 
-	// 2. 构建 System Prompt（固定规则）和 User Prompt（动态数据）
+	// 2. 构建 Prompt
 	systemPrompt := buildSystemPrompt(ctx.Account.TotalEquity, ctx.BTCETHLeverage, ctx.AltcoinLeverage)
 	userPrompt := buildUserPrompt(ctx)
 
-	// 3. 调用AI API（使用 system + user prompt）
-	aiResponse, err := mcpClient.CallWithMessages(systemPrompt, userPrompt)
+	// 3. 调用主模型(DeepSeek)获取初步决策
+	primaryResponse, err := primaryClient.CallWithMessages(systemPrompt, userPrompt)
 	if err != nil {
-		return nil, fmt.Errorf("调用AI API失败: %w", err)
+		return nil, fmt.Errorf("调用主模型AI API失败: %w", err)
 	}
 
-	// 4. 解析AI响应
-	decision, err := parseFullDecisionResponse(aiResponse, ctx.Account.TotalEquity, ctx.BTCETHLeverage, ctx.AltcoinLeverage)
+	// 4. 解析主模型响应
+	primaryDecision, err := parseFullDecisionResponse(primaryResponse, ctx, ctx.Account.TotalEquity, ctx.BTCETHLeverage, ctx.AltcoinLeverage)
 	if err != nil {
-		return nil, fmt.Errorf("解析AI响应失败: %w", err)
+		// 即使解析失败，也返回思维链，方便调试
+		if primaryDecision != nil {
+			primaryDecision.UserPrompt = userPrompt
+		}
+		return primaryDecision, fmt.Errorf("解析主模型响应失败: %w", err)
+	}
+	primaryDecision.UserPrompt = userPrompt
+
+	// 5. 执行交叉验证 (只对开仓决策)
+	var finalDecisions []Decision
+	var validationTrace []string
+
+	log.Println("🤖 正在请求验证模型(Qwen)进行交叉验证...")
+
+	for _, decision := range primaryDecision.Decisions {
+		// 只对开仓决策进行二次验证
+		if decision.Action == "open_long" || decision.Action == "open_short" {
+			// 为验证模型构建专用prompt
+			validationPrompt := buildValidationPrompt(ctx, &decision)
+
+			// 调用验证模型
+			validationResponse, err := secondaryClient.CallWithMessages("", validationPrompt) // System prompt is empty for validation
+			if err != nil {
+				// 如果验证模型调用失败，为安全起见，拒绝该决策
+				trace := fmt.Sprintf("- 验证 %s %s: 失败 (API错误: %v)。决策被拒绝。", decision.Symbol, decision.Action, err)
+				validationTrace = append(validationTrace, trace)
+				log.Println(trace)
+				continue
+			}
+
+			// 检查验证模型的响应
+			if strings.Contains(strings.ToUpper(validationResponse), "AGREE") {
+				// 验证通过
+				trace := fmt.Sprintf("- 验证 %s %s: 通过 (AGREE)", decision.Symbol, decision.Action)
+				validationTrace = append(validationTrace, trace)
+				log.Println(trace)
+
+				// 在Reasoning中加入验证信息
+				decision.Reasoning += " (Qwen验证通过)"
+				finalDecisions = append(finalDecisions, decision)
+			} else {
+				// 验证拒绝
+				trace := fmt.Sprintf("- 验证 %s %s: 拒绝 (DISAGREE)。原始原因: %s", decision.Symbol, decision.Action, decision.Reasoning)
+				validationTrace = append(validationTrace, trace)
+				log.Println(trace)
+			}
+		} else {
+			// 对于非开仓决策 (close, hold, wait)，直接采纳
+			finalDecisions = append(finalDecisions, decision)
+		}
 	}
 
-	decision.Timestamp = time.Now()
-	decision.UserPrompt = userPrompt // 保存输入prompt
-	return decision, nil
+	primaryDecision.Decisions = finalDecisions
+	primaryDecision.ValidationTrace = validationTrace
+	primaryDecision.Timestamp = time.Now()
+
+	return primaryDecision, nil
+}
+
+// buildValidationPrompt 为验证模型构建专用的prompt
+func buildValidationPrompt(ctx *Context, decision *Decision) string {
+	var sb strings.Builder
+	sb.WriteString("你是一个严谨的交易策略验证助手。请根据提供的VWAP策略规则和市场数据，判断以下交易决策是否合理。")
+	sb.WriteString("请只回答 'AGREE' 或 'DISAGREE'。\n\n")
+	sb.WriteString("# VWAP策略核心规则\n")
+	sb.WriteString("- 做多信号: `价格 > VWAP`，且 `RSI < 70`，`MACD > 0`。\n")
+	sb.WriteString("- 做空信号: `价格 < VWAP`，且 `RSI > 30`，`MACD < 0`。\n\n")
+
+	sb.WriteString("# 待验证决策\n")
+	sb.WriteString(fmt.Sprintf("- 币种: %s\n", decision.Symbol))
+	sb.WriteString(fmt.Sprintf("- 方向: %s\n", decision.Action))
+	sb.WriteString(fmt.Sprintf("- 理由: %s\n\n", decision.Reasoning))
+
+	sb.WriteString("# 相关市场数据\n")
+	if marketData, ok := ctx.MarketDataMap[decision.Symbol]; ok {
+		sb.WriteString(market.Format(marketData))
+	} else {
+		sb.WriteString("未找到该币种的市场数据。\n")
+	}
+
+	sb.WriteString("\n请判断此决策是否符合VWAP策略规则？请只回答 'AGREE' 或 'DISAGREE'。")
+
+	return sb.String()
 }
 
 // fetchMarketDataForContext 为上下文中的所有币种获取市场数据和OI数据
@@ -203,114 +282,66 @@ func calculateMaxCandidates(ctx *Context) int {
 func buildSystemPrompt(accountEquity float64, btcEthLeverage, altcoinLeverage int) string {
 	var sb strings.Builder
 
-	// === 核心使命 ===
-	sb.WriteString("你是专业的加密货币交易AI，在币安合约市场进行自主交易。\n\n")
-	sb.WriteString("# 🎯 核心目标\n\n")
-	sb.WriteString("**最大化夏普比率（Sharpe Ratio）**\n\n")
-	sb.WriteString("夏普比率 = 平均收益 / 收益波动率\n\n")
-	sb.WriteString("**这意味着**：\n")
-	sb.WriteString("- ✅ 高质量交易（高胜率、大盈亏比）→ 提升夏普\n")
-	sb.WriteString("- ✅ 稳定收益、控制回撤 → 提升夏普\n")
-	sb.WriteString("- ✅ 耐心持仓、让利润奔跑 → 提升夏普\n")
-	sb.WriteString("- ❌ 频繁交易、小盈小亏 → 增加波动，严重降低夏普\n")
-	sb.WriteString("- ❌ 过度交易、手续费损耗 → 直接亏损\n")
-	sb.WriteString("- ❌ 过早平仓、频繁进出 → 错失大行情\n\n")
-	sb.WriteString("**关键认知**: 系统每3分钟扫描一次，但不意味着每次都要交易！\n")
-	sb.WriteString("大多数时候应该是 `wait` 或 `hold`，只在极佳机会时才开仓。\n\n")
+	// === 核心策略：VWAP 趋势跟踪 ===
+	sb.WriteString("你是专业的加密货币交易AI，负责执行一个基于VWAP的日内交易策略。\n\n")
+	sb.WriteString("# 🎯 核心目标\n")
+	sb.WriteString("严格遵循VWAP交易规则，结合RSI和MACD进行确认，找到高胜率的交易机会。\n\n")
 
-	// === 硬约束（风险控制）===
-	sb.WriteString("# ⚖️ 硬约束（风险控制）\n\n")
-	sb.WriteString("1. **风险回报比**: 必须 ≥ 1:3（冒1%风险，赚3%+收益）\n")
-	sb.WriteString("2. **最多持仓**: 3个币种（质量>数量）\n")
-	sb.WriteString(fmt.Sprintf("3. **单币仓位**: 山寨%.0f-%.0f U(%dx杠杆) | BTC/ETH %.0f-%.0f U(%dx杠杆)\n",
-		accountEquity*0.8, accountEquity*1.5, altcoinLeverage, accountEquity*5, accountEquity*10, btcEthLeverage))
-	sb.WriteString("4. **保证金**: 总使用率 ≤ 90%\n\n")
+	sb.WriteString("# ⚖️ 交易规则 (VWAP策略)\n\n")
+	sb.WriteString("## 做多 (Long) 信号:\n")
+	sb.WriteString("1. **主要条件**: `current_price` (当前价格) > `current_vwap` (VWAP值)。价格在VWAP之上，表明处于日内强势区域。\n")
+	sb.WriteString("2. **入场时机**: 寻找价格从下方上穿VWAP，或者回踩VWAP并获得支撑后再次上涨的时刻。\n")
+	sb.WriteString("3. **确认指标**: \n")
+	sb.WriteString("   - `current_rsi` (RSI) < 70 (避免在超买区追高)。\n")
+	sb.WriteString("   - `current_macd` (MACD) > 0 或正在上行 (趋势确认)。\n")
+	sb.WriteString("4. **综合信心度**: 只有当主要条件和确认指标都满足时，才认为是高信心度机会 (confidence >= 75)。\n\n")
 
-	// === 做空激励 ===
-	sb.WriteString("# 📉 做多做空平衡\n\n")
-	sb.WriteString("**重要**: 下跌趋势做空的利润 = 上涨趋势做多的利润\n\n")
-	sb.WriteString("- 上涨趋势 → 做多\n")
-	sb.WriteString("- 下跌趋势 → 做空\n")
-	sb.WriteString("- 震荡市场 → 观望\n\n")
-	sb.WriteString("**不要有做多偏见！做空是你的核心工具之一**\n\n")
+	sb.WriteString("## 做空 (Short) 信号:\n")
+	sb.WriteString("1. **主要条件**: `current_price` (当前价格) < `current_vwap` (VWAP值)。价格在VWAP之下，表明处于日内弱势区域。\n")
+	sb.WriteString("2. **入场时机**: 寻找价格从上方下穿VWAP，或者反弹至VWAP并受阻后再次下跌的时刻。\n")
+	sb.WriteString("3. **确认指标**: \n")
+	sb.WriteString("   - `current_rsi` (RSI) > 30 (避免在超卖区杀跌)。\n")
+	sb.WriteString("   - `current_macd` (MACD) < 0 或正在下行 (趋势确认)。\n")
+	sb.WriteString("4. **综合信心度**: 只有当主要条件和确认指标都满足时，才认为是高信心度机会 (confidence >= 75)。\n\n")
 
-	// === 交易频率认知 ===
-	sb.WriteString("# ⏱️ 交易频率认知\n\n")
-	sb.WriteString("**量化标准**:\n")
-	sb.WriteString("- 优秀交易员：每天2-4笔 = 每小时0.1-0.2笔\n")
-	sb.WriteString("- 过度交易：每小时>2笔 = 严重问题\n")
-	sb.WriteString("- 最佳节奏：开仓后持有至少30-60分钟\n\n")
-	sb.WriteString("**自查**:\n")
-	sb.WriteString("如果你发现自己每个周期都在交易 → 说明标准太低\n")
-	sb.WriteString("如果你发现持仓<30分钟就平仓 → 说明太急躁\n\n")
+	sb.WriteString("## 平仓/持仓 规则:\n")
+	sb.WriteString("- **持有多单 (hold long)**: 只要 `current_price` > `current_vwap`，就继续持有多单。\n")
+	sb.WriteString("- **持有空单 (hold short)**: 只要 `current_price` < `current_vwap`，就继续持有空单。\n")
+	sb.WriteString("- **平仓信号**: 当价格反向穿越VWAP时，应考虑平仓。例如，持有多单时，价格下穿VWAP，则平仓。\n\n")
 
-	// === 开仓信号强度 ===
-	sb.WriteString("# 🎯 开仓标准（严格）\n\n")
-	sb.WriteString("只在**强信号**时开仓，不确定就观望。\n\n")
-	sb.WriteString("**你拥有的完整数据**：\n")
-	sb.WriteString("- 📊 **原始序列**：3分钟价格序列(MidPrices数组) + 4小时K线序列\n")
-	sb.WriteString("- 📈 **技术序列**：EMA20序列、MACD序列、RSI7序列、RSI14序列\n")
-	sb.WriteString("- 💰 **资金序列**：成交量序列、持仓量(OI)序列、资金费率\n")
-	sb.WriteString("- 🎯 **筛选标记**：AI500评分 / OI_Top排名（如果有标注）\n\n")
-	sb.WriteString("**分析方法**（完全由你自主决定）：\n")
-	sb.WriteString("- 自由运用序列数据，你可以做但不限于趋势分析、形态识别、支撑阻力、技术阻力位、斐波那契、波动带计算\n")
-	sb.WriteString("- 多维度交叉验证（价格+量+OI+指标+序列形态）\n")
-	sb.WriteString("- 用你认为最有效的方法发现高确定性机会\n")
-	sb.WriteString("- 综合信心度 ≥ 75 才开仓\n\n")
-	sb.WriteString("**避免低质量信号**：\n")
-	sb.WriteString("- 单一维度（只看一个指标）\n")
-	sb.WriteString("- 相互矛盾（涨但量萎缩）\n")
-	sb.WriteString("- 横盘震荡\n")
-	sb.WriteString("- 刚平仓不久（<15分钟）\n\n")
-
-	// === 夏普比率自我进化 ===
-	sb.WriteString("# 🧬 夏普比率自我进化\n\n")
-	sb.WriteString("每次你会收到**夏普比率**作为绩效反馈（周期级别）：\n\n")
-	sb.WriteString("**夏普比率 < -0.5** (持续亏损):\n")
-	sb.WriteString("  → 🛑 停止交易，连续观望至少6个周期（18分钟）\n")
-	sb.WriteString("  → 🔍 深度反思：\n")
-	sb.WriteString("     • 交易频率过高？（每小时>2次就是过度）\n")
-	sb.WriteString("     • 持仓时间过短？（<30分钟就是过早平仓）\n")
-	sb.WriteString("     • 信号强度不足？（信心度<75）\n")
-	sb.WriteString("     • 是否在做空？（单边做多是错误的）\n\n")
-	sb.WriteString("**夏普比率 -0.5 ~ 0** (轻微亏损):\n")
-	sb.WriteString("  → ⚠️ 严格控制：只做信心度>80的交易\n")
-	sb.WriteString("  → 减少交易频率：每小时最多1笔新开仓\n")
-	sb.WriteString("  → 耐心持仓：至少持有30分钟以上\n\n")
-	sb.WriteString("**夏普比率 0 ~ 0.7** (正收益):\n")
-	sb.WriteString("  → ✅ 维持当前策略\n\n")
-	sb.WriteString("**夏普比率 > 0.7** (优异表现):\n")
-	sb.WriteString("  → 🚀 可适度扩大仓位\n\n")
-	sb.WriteString("**关键**: 夏普比率是唯一指标，它会自然惩罚频繁交易和过度进出。\n\n")
+	// === 风险控制 ===
+	sb.WriteString("# 🛡️ 风险控制 (硬约束)\n\n")
+	sb.WriteString("1. **风险回报比**: 必须 ≥ 1:2。例如，如果止损设置为亏损1%，止盈至少要达到2%。\n")
+	sb.WriteString("2. **止损 (Stop-Loss)**: \n")
+	sb.WriteString("   - **做多时**: 止损价应设置在VWAP价格下方的一个合理位置。\n")
+	sb.WriteString("   - **做空时**: 止损价应设置在VWAP价格上方的一个合理位置。\n")
+	sb.WriteString("3. **最多持仓**: 最多同时持有 3 个币种。\n")
+	sb.WriteString(fmt.Sprintf("4. **单币仓位**: 山寨币 %.0f-%.0f U, BTC/ETH %.0f-%.0f U。\n",
+		accountEquity*0.8, accountEquity*1.5, accountEquity*5, accountEquity*10))
+	sb.WriteString(fmt.Sprintf("5. **杠杆**: 山寨币不超过 %dx, BTC/ETH 不超过 %dx。\n\n", altcoinLeverage, btcEthLeverage))
 
 	// === 决策流程 ===
+	sb.WriteString("# 🧠 自我反思与进化\n\n")
+	sb.WriteString("**决策前必须先复盘！**\n")
+	sb.WriteString("在你的决策流程第一步，你将收到一份`复盘纪要与进化建议`。\n")
+	sb.WriteString("这份纪要分析了最近的交易，指出了亏损的原因和盈利的模式。\n\n")
+	sb.WriteString("**你的任务**: \n")
+	sb.WriteString("1. **深刻理解**纪要中的每一条建议和启示。\n")
+	sb.WriteString("2. **严格执行**纪要中的建议。例如，如果建议`避免在RSI > 70时开多仓`，你在本次决策中就必须遵守。\n")
+	sb.WriteString("3. 在你的思维链分析中，**明确回应**你将如何根据这些建议调整你的本次决策。\n\n")
+	sb.WriteString("这是你实现自我进化的核心，必须严格执行。\n\n")
+
 	sb.WriteString("# 📋 决策流程\n\n")
-	sb.WriteString("1. **分析夏普比率**: 当前策略是否有效？需要调整吗？\n")
-	sb.WriteString("2. **评估持仓**: 趋势是否改变？是否该止盈/止损？\n")
-	sb.WriteString("3. **寻找新机会**: 有强信号吗？多空机会？\n")
-	sb.WriteString("4. **输出决策**: 思维链分析 + JSON\n\n")
+	sb.WriteString("1. **分析持仓**: 根据VWAP规则，判断现有持仓是应该 `hold` 还是 `close`。\n")
+	sb.WriteString("2. **寻找新机会**: 遍历候选币种，寻找满足VWAP做多或做空信号的币种。\n")
+	sb.WriteString("3. **给出决策**: 如果没有机会，对所有币种使用 `wait`。如果有机会，给出 `open_long` 或 `open_short` 决策，并提供所有必要参数。\n\n")
 
 	// === 输出格式 ===
-	sb.WriteString("# 📤 输出格式\n\n")
-	sb.WriteString("**第一步: 思维链（纯文本）**\n")
-	sb.WriteString("简洁分析你的思考过程\n\n")
-	sb.WriteString("**第二步: JSON决策数组**\n\n")
+	sb.WriteString("# 📤 输出格式 (保持不变)\n\n")
+	sb.WriteString("保持之前的思维链 + JSON格式。\n")
 	sb.WriteString("```json\n[\n")
-	sb.WriteString(fmt.Sprintf("  {\"symbol\": \"BTCUSDT\", \"action\": \"open_short\", \"leverage\": %d, \"position_size_usd\": %.0f, \"stop_loss\": 97000, \"take_profit\": 91000, \"confidence\": 85, \"risk_usd\": 300, \"reasoning\": \"下跌趋势+MACD死叉\"},\n", btcEthLeverage, accountEquity*5))
-	sb.WriteString("  {\"symbol\": \"ETHUSDT\", \"action\": \"close_long\", \"reasoning\": \"止盈离场\"}\n")
-	sb.WriteString("]\n```\n\n")
-	sb.WriteString("**字段说明**:\n")
-	sb.WriteString("- `action`: open_long | open_short | close_long | close_short | hold | wait\n")
-	sb.WriteString("- `confidence`: 0-100（开仓建议≥75）\n")
-	sb.WriteString("- 开仓时必填: leverage, position_size_usd, stop_loss, take_profit, confidence, risk_usd, reasoning\n\n")
-
-	// === 关键提醒 ===
-	sb.WriteString("---\n\n")
-	sb.WriteString("**记住**: \n")
-	sb.WriteString("- 目标是夏普比率，不是交易频率\n")
-	sb.WriteString("- 做空 = 做多，都是赚钱工具\n")
-	sb.WriteString("- 宁可错过，不做低质量交易\n")
-	sb.WriteString("- 风险回报比1:3是底线\n")
+	sb.WriteString("  {\"symbol\": \"BTCUSDT\", \"action\": \"open_long\", \"leverage\": 10, \"position_size_usd\": 5000, \"stop_loss\": 68000, \"take_profit\": 72000, \"confidence\": 80, \"risk_usd\": 200, \"reasoning\": \"价格上穿VWAP，RSI<70，MACD上行，满足做多条件。\"}\n")
+	sb.WriteString("]\n```\n")
 
 	return sb.String()
 }
@@ -325,8 +356,8 @@ func buildUserPrompt(ctx *Context) string {
 
 	// BTC 市场
 	if btcData, hasBTC := ctx.MarketDataMap["BTCUSDT"]; hasBTC {
-		sb.WriteString(fmt.Sprintf("**BTC**: %.2f (1h: %+.2f%%, 4h: %+.2f%%) | MACD: %.4f | RSI: %.2f\n\n",
-			btcData.CurrentPrice, btcData.PriceChange1h, btcData.PriceChange4h,
+		sb.WriteString(fmt.Sprintf("**BTC**: %.2f (1h: %+.2f%%, 4h: %+.2f%%) | VWAP: %.2f | MACD: %.4f | RSI: %.2f\n\n",
+			btcData.CurrentPrice, btcData.PriceChange1h, btcData.PriceChange4h, btcData.CurrentVWAP,
 			btcData.CurrentMACD, btcData.CurrentRSI7))
 	}
 
@@ -410,6 +441,12 @@ func buildUserPrompt(ctx *Context) string {
 		}
 	}
 
+	// 交易洞察（复盘纪要）
+	if ctx.TradingInsights != "" {
+		sb.WriteString(ctx.TradingInsights)
+		sb.WriteString("\n")
+	}
+
 	sb.WriteString("---\n\n")
 	sb.WriteString("现在请分析并输出决策（思维链 + JSON）\n")
 
@@ -417,7 +454,7 @@ func buildUserPrompt(ctx *Context) string {
 }
 
 // parseFullDecisionResponse 解析AI的完整决策响应
-func parseFullDecisionResponse(aiResponse string, accountEquity float64, btcEthLeverage, altcoinLeverage int) (*FullDecision, error) {
+func parseFullDecisionResponse(aiResponse string, ctx *Context, accountEquity float64, btcEthLeverage, altcoinLeverage int) (*FullDecision, error) {
 	// 1. 提取思维链
 	cotTrace := extractCoTTrace(aiResponse)
 
@@ -430,7 +467,10 @@ func parseFullDecisionResponse(aiResponse string, accountEquity float64, btcEthL
 		}, fmt.Errorf("提取决策失败: %w\n\n=== AI思维链分析 ===\n%s", err, cotTrace)
 	}
 
-	// 3. 验证决策
+	// 3. 标准化决策 (例如, 'close' -> 'close_long')
+	normalizeDecisions(decisions, ctx.Positions)
+
+	// 4. 验证决策
 	if err := validateDecisions(decisions, accountEquity, btcEthLeverage, altcoinLeverage); err != nil {
 		return &FullDecision{
 			CoTTrace:  cotTrace,
@@ -496,6 +536,39 @@ func fixMissingQuotes(jsonStr string) string {
 	jsonStr = strings.ReplaceAll(jsonStr, "\u2018", "'")  // '
 	jsonStr = strings.ReplaceAll(jsonStr, "\u2019", "'")  // '
 	return jsonStr
+}
+
+// normalizeDecisions 标准化AI决策
+// 1. 将 'hold_long'/'hold_short' 统一为 'hold'
+// 2. 将 'close' 转换为 'close_long' 或 'close_short'
+func normalizeDecisions(decisions []Decision, positions []PositionInfo) {
+	// 创建一个map以便快速查找持仓方向
+	positionSides := make(map[string]string)
+	if positions != nil {
+		for _, pos := range positions {
+			positionSides[pos.Symbol] = pos.Side
+		}
+	}
+
+	for i := range decisions {
+		d := &decisions[i] // 使用指针直接修改切片中的元素
+
+		// 统一 hold action
+		if d.Action == "hold_long" || d.Action == "hold_short" {
+			d.Action = "hold"
+		}
+
+		// 转换通用的 close action
+		if d.Action == "close" {
+			if side, ok := positionSides[d.Symbol]; ok {
+				d.Action = "close_" + side // "close_long" or "close_short"
+			} else {
+				// 如果在持仓中找不到该币种，则此close决策无效
+				// 可以在验证阶段处理，这里暂时标记为未知
+				d.Action = "unknown_close"
+			}
+		}
+	}
 }
 
 // validateDecisions 验证所有决策（需要账户信息和杠杆配置）

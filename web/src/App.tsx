@@ -658,6 +658,32 @@ function DecisionCard({ decision, language }: { decision: DecisionRecord; langua
         </div>
       )}
 
+      {/* AI Cross-Validation - Collapsible */}
+      {decision.validation_trace && decision.validation_trace.length > 0 && (
+        <div className="mb-3">
+          <div className="flex items-center gap-2 text-sm" style={{ color: '#c084fc' }}>
+            <span className="font-semibold">🔍 AI Cross-Validation (Qwen)</span>
+          </div>
+          <div className="mt-2 rounded p-4 text-sm font-mono whitespace-pre-wrap max-h-96 overflow-y-auto space-y-1" style={{ background: '#0B0E11', border: '1px solid #2B3139', color: '#EAECEF' }}>
+            {decision.validation_trace.map((trace, i) => {
+              const isAgree = trace.includes('AGREE') || trace.includes('通过');
+              const isDisagree = trace.includes('DISAGREE') || trace.includes('拒绝');
+              let color = '#848E9C';
+              if (isAgree) color = '#0ECB81';
+              if (isDisagree) color = '#F6465D';
+
+              return (
+                <div key={i} style={{ color }}>
+                  {isAgree && '✓ '}
+                  {isDisagree && '✗ '}
+                  {trace}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
       {/* Decisions Actions */}
       {decision.decisions && decision.decisions.length > 0 && (
         <div className="space-y-2 mb-3">

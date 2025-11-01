@@ -3,7 +3,7 @@
     {
       "id": "aster_deepseek",
       "name": "Aster DeepSeek Trader",
-      "ai_model": "qwen",
+      "ai_model": "deepseek",
       "exchange": "aster",
       "aster_user": "0xa20Ef3f57d8d8904805b0348a274c8b9FE1C6597",
       "aster_signer": "0x5554435b55ed43167D5C6B8cf9d92faF371e7Dc9",
@@ -11,12 +11,13 @@
       "deepseek_key": "sk-56774e52108c41a1869c3048527f958a",
       "qwen_key": "sk-17978ef444934aaa8044d8d14611d4e5",
       "initial_balance": 299.0,
-      "scan_interval_minutes": 3
+      "scan_interval_minutes": 3,
+      "enabled": true
     }
   ],
   "leverage": {
-    "btc_eth_leverage": 30,
-    "altcoin_leverage": 30
+    "btc_eth_leverage": 20,
+    "altcoin_leverage": 20
   },
   "use_default_coins": true,
   "coin_pool_api_url": "",

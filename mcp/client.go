@@ -55,7 +55,7 @@ func (cfg *Client) SetQwenAPIKey(apiKey, secretKey string) {
 	cfg.APIKey = apiKey
 	cfg.SecretKey = secretKey
 	cfg.BaseURL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-	cfg.Model = "qwen-plus" // 可选: qwen-turbo, qwen-plus, qwen-max
+	cfg.Model = "qwen-max" // 可选: qwen-turbo, qwen-plus, qwen-max
 }
 
 // SetCustomAPI 设置自定义OpenAI兼容API
